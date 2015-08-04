@@ -1,0 +1,225 @@
+import os
+import sys
+import fcntl
+import subprocess
+
+
+#-------------------------Prevents 2 instances of display2.py--------------
+def lockFile(lockfile):
+ fp = os.open(lockfile, os.O_CREAT | os.O_TRUNC | os.O_WRONLY)
+ try:
+  fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ except IOError:
+  print ('Program is already running elsewhere. \nPlease see file: consoleDisplay.info')
+  return False
+ return True
+
+if not lockFile(".display.lock"):
+ sys.exit(1)
+
+import time                     #used for 1 run every hour (Weather API)
+import datetime                 #used to save timestamp
+import Adafruit_DHT             #AM2302 sensor library
+from decimal import Decimal     #for general conversions
+import json                     #for Weather API
+import urllib2                  #Client/server connections
+import socket                   #So we can reduce the conneciton timeout
+import RPi.GPIO as GPIO         #Raspberry GPIOs
+
+#2 sensor, for increased accuracy
+sensor1 = Adafruit_DHT.AM2302
+sensorpin1 = 6
+sensor2 = Adafruit_DHT.AM2302
+sensorpin2 = 5
+
+
+timeout = 2 #en secondes
+socket.setdefaulttimeout(timeout)
+
+GPIO.setmode(GPIO.BCM)
+
+#------------------Read temperature and humidity from both AM2302 sensors----------------
+def ReadTemp():
+ humidityraw1, temperatureraw1 = Adafruit_DHT.read_retry(sensor1, sensorpin1)
+ temperature1 = '%04.1f' % temperatureraw1
+ humidity1 = '%04.1f' % humidityraw1
+ if float(humidity1) > 99.9:
+  humidity1 = '99.9'
+ humidityraw2, temperatureraw2 = Adafruit_DHT.read_retry(sensor2, sensorpin2)
+ temperature2 = '%04.1f' % temperatureraw2
+ humidity2 = '%04.1f' % humidityraw2
+ if float(humidity2) > 99.9:
+  humidity2 = '99.9'
+ return humidity1, temperature1, humidity2, temperature2
+
+#-------------------ReadGarden is now handled by the PHP server---------------
+#def ReadGarden():
+# try:
+#  req = urllib2.Request('http://192.168.1.250')
+#  response = urllib2.urlopen(req)
+#  html = response.read()
+#  html = response.read()
+#  #print html
+#  return html
+# except:
+#  #print ('Server not online')
+#  return 1234.5
+
+def ReadExt():
+ #-----------------------Read external from OpenWeatherMap--------------------
+ try:
+  f = urllib2.urlopen('http://api.openweathermap.org/data/2.5/weather?q=laval,qc&units=metric&APPID=8d1a81a2d82ba6548a05b9252cc638f9')
+  json_string = f.read()
+  parsed_json = json.loads(json_string)
+  temp_f = parsed_json['main']['temp']
+  hum_f = parsed_json['main']['humidity'] #not used as of now
+  f.close()
+  return temp_f
+ except:
+  #-----------------------If OpenWeatherMap failed, try Yahoo Weather------------
+  try:
+   print ('Openweathermap API failed. Fallback on Yahoo Weather')
+   f = urllib2.urlopen("https://query.yahooapis.com/v1/public/yql?q=select%20item.condition.temp%20from%20weather.forecast%20where%20woeid%20%3D%2012697213%20AND%20u%20%3D%20'c'&format=json&env=store%3A%2F%2Fdatatables.org%2Falltableswi$
+   json_string = f.read()
+   parsed_json = json.loads(json_string)
+   temp_f = parsed_json['query']['results']['channel']['item']['condition']['temp']
+   #hum_f = parsed_json['main']['humidity']
+   f.close()
+   return temp_f
+  except:
+   print ('well both failed, no outside weather (heater will turn OFF by default)')
+   return 99.9
+#------------------------Write all info to USB in text file (easier for viewing on FTP)---------
+def UpdateUSB(outside_temp, hum1, inside_temp1, hum2, inside_temp2):
+ out_temp = float(outside_temp)
+ in_hum1 = float(hum1)
+ in_temp1 = float(inside_temp1)
+ in_hum2 = float(hum2)
+ in_temp2 = float(inside_temp2)
+
+ #Let's write the LOG of all info available
+ f = open('/media/USB/TemperatureLog.info', 'a')
+ f.write('\n' + time.asctime(time.localtime(time.time())) + '   ')
+ f.write(str(out_temp) + '      ')
+ f.write(str(in_temp1) + '      ')
+ f.write(str(in_temp2) + '      ')
+ f.write(str(in_hum1) + '        ')
+ f.write(str(in_hum2) + '       ')
+ f.close()
+
+def UpdateGraph(outside_temp, hum1, inside_temp1, hum2, inside_temp2):
+ out_temp = float(outside_temp)
+ in_hum1 = float(hum1)
+ in_temp1 = float(inside_temp1)
+ in_hum2 = float(hum2)
+ in_temp2 = float(inside_temp2)
+
+ #Let's write the file used for graphs generation
+ f = open('/media/USB/Temp.current', 'w')
+ f.write('\n' + 'T=' + str(in_temp1) + ' ')
+ f.write('H=' + str(in_hum1) + ' ')
+ f.write('T2=' + str(in_temp2) + ' ')
+ f.write('H2=' + str(in_hum2) + ' ')
+ f.write('OUT=' + str(out_temp) + ' ')
+ f.write('TM=' + str((in_temp1+in_temp2)/2) + ' ')
+ f.write('HM=' + str((in_hum1+in_hum2)/2) + ' ')
+ f.close()
+
+
+#-------------------------Crude filter to eliminate spikes or false readings--------------
+def filter(what, moyenne, byhowmuch, last):
+ what = float(what)
+ moyenne = float(moyenne)
+ byhowmuch = float(byhowmuch)
+ last = float(last)
+ if what > (moyenne + byhowmuch) or \
+   what < (moyenne - byhowmuch):
+    print(time.asctime(time.localtime(time.time())))
+    print('oops.. ' + str(what) + ' etait soit + grand, ou plus petit que ' + str(moyenne) + ' par ' + (str(moyenne-what)) + ' (maximum: ' + str(byhowmuch) + ') on va mettre ' + str(last) + ' a la place')
+    #Reading was errorneus, we put the last reading in its place
+    what = last
+ return what
+
+
+#----------------------------First pass--------------------------
+out_temp = ReadExt()
+humidity1, temperature1, humidity2, temperature2 = ReadTemp()
+UpdateUSB(out_temp, humidity1, temperature1, humidity2, temperature2)
+
+#------------DEBUG
+#print ('\r')
+#print ('Humidity1: ' + str(humidity1))
+#print ('Temperature1: ' + str(temperature1))
+#print ('Humidity2: ' + str(humidity2))
+#print ('Temperature2: ' + str(temperature2))
+#print ('\r')
+
+#We will use the average (both those sensors are together)
+TempMoy = (float(temperature1) + float(temperature2))/2
+HumMoy = (float(humidity1) + float(humidity2))/2
+
+#-------------DEBUG
+#print ('\r')
+#print ('inside temperature is: ' + str(TempMoy))
+#print ('inside humidity is: ' + str(HumMoy))
+
+
+time2 = time.time() #used to get weather from web api every 30 minutes
+
+#Debug
+#runonce = 1
+
+
+while 1:
+ try:
+  #Wait 5 seconds before running (again)
+  #This will mean we update the LOG every 5 seconds(+code processing)
+  #but we read API only every 30 minutes (based on current time)
+  time.sleep(5)
+
+  #save the data from last run
+  lasttemp1 = temperature1
+  lasttemp2 = temperature2
+  lasthum1 = humidity1
+  lasthum2 = humidity2
+  lastHumMoy = HumMoy
+  lastTempMoy = TempMoy
+
+  #Gather new data
+  humidity1, temperature1, humidity2, temperature2 = ReadTemp()
+
+  #We will use average for filtering
+  TempMoye = (float(temperature1) + float(temperature2))/2
+  HumMoye = (float(humidity1) + float(humidity2))/2
+
+  #Write the LOG (unfiltered)
+  UpdateUSB(out_temp, humidity1, temperature1, humidity2, temperature2)
+
+  #Filter spikes and large deviations for graph
+  temperature1 = filter(temperature1, lastTempMoy, 1.5, lasttemp1)
+  temperature2 = filter(temperature2, lastTempMoy, 1.5, lasttemp2)
+  humidity1 = filter(humidity1, lastHumMoy, 5, lasthum1)
+  humidity2 = filter(humidity2, lastHumMoy, 5, lasthum2)
+
+  #Write the Graph Files
+  UpdateGraph(out_temp, humidity1, temperature1, humidity2, temperature2)
+
+
+  #So we can run every 30  minutes
+  time1 = time.time()
+
+  #30 minutes or more elapsed
+  if float(time1) > float(time2)+1800:
+   #Read API. Don't bother to update LOG, we will do it in 5 seconds on next run
+   out_temp = ReadExt()
+   time2 = time.time()
+
+ except KeyboardInterrupt:
+  GPIO.cleanup()
+  print ('User stopped program')
+  raise
+ except:
+  print ('Something went really wrong')
+  print sys.exc_info()[0]
+GPIO.cleanup()
+
