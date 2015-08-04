@@ -1,0 +1,150 @@
+/*
+ *  This sketch sends data via HTTP GET requests to local Raspberry Pi server
+ *
+ *  
+ *  
+ *
+ */
+#include <SHT1x.h>
+#include <OneWire.h>
+#include <ESP8266WiFi.h>
+
+OneWire  ds(4);  // on pin 4 (a 4.7K resistor is necessary)
+SHT1x SoilSensor(12,13); //future sensor
+
+const char* ssid = "ssid";
+const char* password = "password"; 
+const char* host = "192.168.1.200"; //can be something else
+
+
+//Credit to ... someone on the internet (sorry!). 
+float getthefuckingtemp(){
+  byte i;
+  byte present = 0;
+  byte type_s;
+  byte data[12];
+  byte addr[8];
+  float celsius, fahrenheit;
+  if ( !ds.search(addr)) {
+    //Serial.println("No more addresses.");
+    //Serial.println();
+    ds.reset_search();
+    delay(100);
+    celsius = -125;
+  }
+  else {
+    
+    
+    if (OneWire::crc8(addr, 7) != addr[7]) {
+        Serial.println("CRC is not valid!");
+        celsius = -125;
+    }
+   
+    ds.reset();
+    ds.select(addr);
+    ds.write(0x44, 1);        // start conversion, with parasite power on at the end
+    
+    delay(750);     // maybe 750ms is enough, maybe not
+    // we might do a ds.depower() here, but the reset will take care of it.
+    
+    present = ds.reset();
+    ds.select(addr);    
+    ds.write(0xBE);         // Read Scratchpad
+  
+  
+  
+    // Convert the data to actual temperature
+    // because the result is a 16 bit signed integer, it should
+    // be stored to an "int16_t" type, which is always 16 bits
+    // even when compiled on a 32 bit processor.
+    for ( i = 0; i < 9; i++) {           // we need 9 bytes
+      data[i] = ds.read();
+    }
+    int16_t raw = (data[1] << 8) | data[0];
+    if (type_s) {
+      raw = raw << 3; // 9 bit resolution default
+      if (data[7] == 0x10) {
+        // "count remain" gives full 12 bit resolution
+        raw = (raw & 0xFFF0) + 12 - data[6];
+      }
+    } else {
+      byte cfg = (data[4] & 0x60);
+      // at lower res, the low bits are undefined, so let's zero them
+      if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
+      else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
+      else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
+      //// default is 12 bit resolution, 750 ms conversion time
+    }
+    celsius = (float)raw / 16.0;
+    
+  }
+  return celsius;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  // We start by connecting to a WiFi network
+
+  //Serial.println();
+  Serial.println("");
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");  
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+
+void loop() {
+
+  //DEBUG
+  //Serial.print("connecting to ");
+  //Serial.println(host);
+  
+  // Use WiFiClient class to create TCP connections
+  WiFiClient client;
+  const int httpPort = 80;
+  if (!client.connect(host, httpPort)) {
+    Serial.println("connection failed");
+    return;
+  }
+ 
+  float temp = getthefuckingtemp();
+  while( temp < -100) { //Bad reading = -125
+    temp = getthefuckingtemp();
+  }
+  String data = "temp1=" + (String)temp;
+  // We now create a URI for the request
+  String url = "GET /add.php?" + data + " HTTP/1.1";
+
+  //DEBUG
+  //Serial.print("Requesting URL: ");
+  //Serial.println(url);
+
+  client.println(url);
+  client.println("Host: 192.168.1.200");
+  client.println("Connection: close");
+  client.println();
+  delay(500);
+  
+  // Read all the lines of the reply from server and print them to Serial
+  while(client.available()){
+    String line = client.readStringUntil('\r');
+    Serial.print(line);
+  }
+  client.stop(); //Stopping client
+  ESP.deepSleep(30 * 60 * 1000000); //30 minutes sleep
+  delay(1000); //for above sleep
+}
